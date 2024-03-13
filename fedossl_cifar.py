@@ -17,6 +17,11 @@ import os
 from torch.utils.tensorboard import SummaryWriter
 from itertools import cycle
 
+
+# Global settings #     #
+is_track = True         #
+# --------------- #     #
+
 def euclidean_dist(x, y):
     m, n = x.size(0), y.size(0)
     xx = torch.pow(x, 2).sum(1, keepdim=True).expand(m, n)
@@ -25,8 +30,6 @@ def euclidean_dist(x, y):
     dist.addmm_(1, -2, x, y.t())
     dist = dist.clamp(min=1e-12).sqrt()  # for numerical stability
     return dist
-
-
 
 def receive_models(clients_model):
     global uploaded_weights
@@ -37,7 +40,6 @@ def receive_models(clients_model):
         uploaded_weights.append( 1.0 / len(clients_model)) # each model is given equal importance in the aggregation process
         # self.uploaded_models.append(copy.deepcopy(client.model.parameters()))
         uploaded_models.append(model.parameters())
-
 
 def add_parameters(w, client_model):
     for (name, server_param), client_param in zip(global_model.named_parameters(), client_model):
@@ -72,240 +74,238 @@ def args_setting():
     parser.add_argument('-b', '--batch-size', default=512, type=int,
                     metavar='N',
                     help='mini-batch size')
+    parser.add_argument('--gpu', default='0', type=str,help='id(s) for CUDA_VISIBLE_DEVICES')
     args = parser.parse_args()
     args.cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if args.cuda else "cpu")
+    # device = torch.device("cuda" if args.cuda else "cpu")
+    device = torch.device("cuda:"+args.gpu if args.cuda else "cpu")
     print("-------------------- use ",device,"-----------")
     args.savedir = os.path.join(args.exp_root, args.name)
     if not os.path.exists(args.savedir):
         os.makedirs(args.savedir)
     return args, device
 
-
-
 def train(args, model, device, train_label_loader, train_unlabel_loader, optimizer, m, epoch, tf_writer, client_id, global_round): # m refers to mean_uncert
+
     model.local_labeled_centroids.weight.data.zero_()  # model.local_labeled_centroids.weight.data: torch.Size([10, 512])
     labeled_samples_num = [0 for _ in range(10)]
     model.train()
+
     bce = nn.BCELoss()
     m = min(m, 0.5)
     # m = 0
     ce = MarginLoss(m=-1*m)
     unlabel_ce = MarginLoss(m=0) #(m=-1*m)
     unlabel_loader_iter = cycle(train_unlabel_loader)
-    bce_losses = AverageMeter('bce_loss', ':.4e')
-    ce_losses = AverageMeter('ce_loss', ':.4e')
-    entropy_losses = AverageMeter('entropy_loss', ':.4e')
-    #
-    np_cluster_preds = np.array([]) # cluster_preds
-    np_unlabel_targets = np.array([])
-    
+
+    # ----- ################################### -----
+    if is_track:
+        bce_losses, ce_losses, entropy_losses  = AverageMeter('bce_loss', ':.4e'), AverageMeter('ce_loss', ':.4e'), AverageMeter('entropy_loss', ':.4e')
+        conf_pred, conf_cls = AverageMeter("conf_pred", ":.4e"), AverageMeter("conf_cls", ":.4e")
+        np_cluster_preds = np.array([]) # cluster_preds
+        np_unlabel_targets = np.array([])
+
+        # pred_prev, pred_sk = torch.tensor([]).cuda(), torch.tensor([]).cuda()
+        # conf_prev, conf_swav = AverageMeter("conf_prev", ":.4e"), AverageMeter("conf_swav", ":.4e")
+        # accept_id, accept_ood = 0, 0
+        # all_label_in_Epoch = torch.tensor([]).cuda() # for baselinevv, this only recode unlabeled data
+        # id_probs = AverageMeter("id_probs", ":.4e")
+        # ood_probs = AverageMeter("ood_probs", ":.4e")
+    # ----- ################################### -----
 
     for batch_idx, ((x, x2), target) in enumerate(train_label_loader):
+        
         ## 各个类的不确定性权重（固定值）
         beta = 0.2
         Nk = [1600 * 5, 1600 * 5, 1600 * 5, 1600 * 5, 1600 * 5, 1600 * 5, 1600, 1600, 1600, 1600]
         Nmax = 1600 * 5
         p_weight = [beta**(1-Nk[i]/Nmax) for i in range(10)]
-        #
-        ((ux, ux2), unlabel_target) = next(unlabel_loader_iter)
+        
 
+        ((ux, ux2), unlabel_target) = next(unlabel_loader_iter)
         x = torch.cat([x, ux], 0)
         x2 = torch.cat([x2, ux2], 0)
-        
         labeled_len = len(target)
-        # print("labeled_len: ", labeled_len)
 
         x, x2, target = x.to(device), x2.to(device), target.to(device)
         optimizer.zero_grad()
-        output, feat = model(x) #output: [batch size, 10]; feat: [batch size, 512]
+        output, feat = model(x) # output: [batch size, 10]; feat: [batch size, 512]
         output2, feat2 = model(x2)
         prob = F.softmax(output, dim=1)
         reg_prob = F.softmax(output[labeled_len:], dim=1) # unlabel data's prob
         prob2 = F.softmax(output2, dim=1)
         reg_prob2 = F.softmax(output2[labeled_len:], dim=1)  # unlabel data's prob
 
-        # update local_labeled_centroids
-        # step1: 统计每个类别的样本数，以及每个类别的特征向量之和
+        # Update local_labeled_centroids
+        # step1: Count the number of each class (labeled data), and sum the feature vectors of each class
         for feature, true_label in zip(feat[:labeled_len].detach().clone(), target):
             labeled_samples_num[true_label] += 1
             model.local_labeled_centroids.weight.data[true_label] += feature
-        # print("before model.local_labeled_centroids.weight.data: ", model.local_labeled_centroids.weight.data)
-        # step2: 更新每个类别的特征向量
-        for idx, (feature_centroid, num) in enumerate(zip(model.local_labeled_centroids.weight.data, labeled_samples_num)):
+        # step2: Update feature vector for each class
+        for idx, (feature_centroid, num) in enumerate(zip(model.local_labeled_centroids.weight.data, labeled_samples_num)): # idx from 0 to 9
             if num > 0:
                 model.local_labeled_centroids.weight.data[idx] = feature_centroid/num
-        # print("model.local_labeled_centroids.weight.data size: ", model.local_labeled_centroids.weight.data.size())
-        # print("model.local_labeled_centroids.weight.data: ", model.local_labeled_centroids.weight.data)
-        # print("labeled_samples_num: ", labeled_samples_num)
-        # L_reg:  reg_prob中每一行的预测label
-        copy_reg_prob1 = copy.deepcopy(reg_prob.detach())
-        copy_reg_prob2 = copy.deepcopy(reg_prob2.detach())
-        reg_label1 = np.argmax(copy_reg_prob1.cpu().numpy(), axis=1)
-        reg_label2 = np.argmax(copy_reg_prob2.cpu().numpy(), axis=1)
-        ### 制作target, target 除了 label=1 外与 reg_prob 一致
-        for idx, (label, oprob) in enumerate(zip(reg_label1, copy_reg_prob1)):
-            copy_reg_prob1[idx][label] = 1
-        for idx, (label, oprob) in enumerate(zip(reg_label2, copy_reg_prob2)):
-            copy_reg_prob2[idx][label] = 1
-        
-        L1_loss = nn.L1Loss()
-        L_reg1 = 0.0
-        L_reg2 = 0.0
-        for idx, (ooutput, otarget, label) in enumerate(zip(reg_prob, copy_reg_prob1, reg_label1)):
-            L_reg1 = L_reg1 + L1_loss(reg_prob[idx], copy_reg_prob1[idx]) * p_weight[label]
-        for idx, (ooutput, otarget, label) in enumerate(zip(reg_prob2, copy_reg_prob2, reg_label2)):
-            L_reg2 = L_reg2 + L1_loss(reg_prob2[idx], copy_reg_prob2[idx]) * p_weight[label]
-        L_reg1 = L_reg1 / len(reg_label1)
-        L_reg2 = L_reg2 / len(reg_label2)
-        #### Ours loss end
-        ## Euclidean Distance ########################################################################
-        # C = model.centroids.weight.data.detach().clone()
-        # Z1 = feat.detach()
-        # Z2 = feat2.detach()
-        # cP1 = euclidean_dist(Z1, C)
-        # cZ2 = euclidean_dist(Z2, C)
-        ## Cluster loss begin (Orchestra) # cos-similarity ###############################
+
         C = model.centroids.weight.data.detach().clone().T # C: [512, 10]
         Z1 = F.normalize(feat, dim=1)
         Z2 = F.normalize(feat2, dim=1)
-        cP1 = Z1 @ C
-        cZ2 = Z2 @ C
-        ##
+        cP1 = Z1 @ C # [Batch size, 10] cosine-similarity
+        cP2 = Z2 @ C # [Batch size, 10]    
         tP1 = F.softmax(cP1 / model.T, dim=1)
-        confidence_cluster_pred, cluster_pred = tP1.max(1) # cluster_pred: [512]; target: [170]
-        tP2 = F.softmax(cZ2 / model.T, dim=1)
-        #logpZ2 = torch.log(F.softmax(cZ2 / model.T, dim=1))
-        # Clustering loss
-        #L_cluster = - torch.sum(tP1 * logpZ2, dim=1).mean()
-        # print("L_cluster: ", L_cluster)
-        ## Cluster loss end (Orchestra)
-        ### 统计 cluster_pred (伪标签，cluster id) 置信度 ###
-        confidence_list = [0 for _ in range(10)]
-        num_of_cluster = [0 for _ in range(10)]
-        #mask_tmp = np.array([])
-        for confidence, cluster_id in zip(confidence_cluster_pred[labeled_len:], cluster_pred[labeled_len:]):
-            confidence_list[cluster_id] = confidence_list[cluster_id] + confidence
-            num_of_cluster[cluster_id] = num_of_cluster[cluster_id] + 1
-        for cluster_id, (sum_confidence, num) in enumerate(zip(confidence_list, num_of_cluster)):
-            if num > 0:
-                confidence_list[cluster_id] = confidence_list[cluster_id].cpu().detach().numpy()/num
-                confidence_list[cluster_id] = np.around(confidence_list[cluster_id], 4) #保留小数点后4位
-        #mask_tmp = np.append(mask_tmp, confidence_cluster_pred[labeled_len:].cpu().detach().numpy())
-        threshold = 0.95
-        # confidence_mask = mask_tmp > threshold
-        confidence_mask = (confidence_cluster_pred[labeled_len:] > threshold)
-        confidence_mask = torch.nonzero(confidence_mask)
-        confidence_mask = torch.squeeze(confidence_mask)
-        if client_id == 0:
-            print("confidence_mask: ", confidence_mask)
-        #print("confidence_mask: ", confidence_mask)
-        #sys.exit(0)
-        #if (args.epochs * global_round + epoch) % 5 == 0:
-        print("global round: ", global_round, ";   client_id: ", client_id, ";   confidence_list: ", confidence_list)
+        tP2 = F.softmax(cP2 / model.T, dim=1)
 
-        # calculate distance
-        feat_detach = feat.detach()
-        feat_norm = feat_detach / torch.norm(feat_detach, 2, 1, keepdim=True)
-        cosine_dist = torch.mm(feat_norm, feat_norm.t())
-        labeled_len = len(target)
 
-        pos_pairs = []
-        target_np = target.cpu().numpy()
-        
 
-        # The `L` objective, including standard cross-entropy (labeled) and clustering loss (unlabeled)
-        # label part
-        for i in range(labeled_len):
-            target_i = target_np[i]
-            idxs = np.where(target_np == target_i)[0]
-            if len(idxs) == 1:
-                pos_pairs.append(idxs[0])
-            else:
-                selec_idx = np.random.choice(idxs, 1)
-                while selec_idx == i:
+        # ------------------------------ Tracking ------------------------------
+        # if is_track:
+        #     conf_pred_b, target_cls_b = torch.max(prob[labeled_len:], dim = -1) # pred: [512]; target: [512]
+        #     conf_cls_b, target_cls = torch.max(tP1[labeled_len:], dim = -1) # cluster_pred: [512]; target: [170]
+        #     conf_pred.update(conf_pred_b.mean().item(), args.batch_size)
+        #     conf_cls.update(conf_cls_b.mean().item(), args.batch_size)
+        # -------------------- ############################# --------------------
+            
+        ################################# L_reg objective #################################
+        # L_reg:  reg_prob中每一行的预测label
+        if True:
+            # abstract the predict labels for each unlabel data  
+            copy_reg_prob1 = copy.deepcopy(reg_prob.detach())
+            copy_reg_prob2 = copy.deepcopy(reg_prob2.detach())
+            reg_label1 = np.argmax(copy_reg_prob1.cpu().numpy(), axis=1)
+            reg_label2 = np.argmax(copy_reg_prob2.cpu().numpy(), axis=1)
+            ### 制作target, target 除了 label=1 外与 reg_prob 一致
+            # ajust copy_reg_prob: make the largest probability -> 1
+            for idx, (label, oprob) in enumerate(zip(reg_label1, copy_reg_prob1)):
+                copy_reg_prob1[idx][label] = 1
+            for idx, (label, oprob) in enumerate(zip(reg_label2, copy_reg_prob2)):
+                copy_reg_prob2[idx][label] = 1
+                    
+            L1_loss = nn.L1Loss()
+            L_reg1, L_reg2 = 0.0, 0.0
+            for idx, (ooutput, otarget, label) in enumerate(zip(reg_prob, copy_reg_prob1, reg_label1)):
+                L_reg1 += L1_loss(reg_prob[idx], copy_reg_prob1[idx]) * p_weight[label]
+            for idx, (ooutput, otarget, label) in enumerate(zip(reg_prob2, copy_reg_prob2, reg_label2)):
+                L_reg2 += L1_loss(reg_prob2[idx], copy_reg_prob2[idx]) * p_weight[label]
+            L_reg1 = L_reg1 / len(reg_label1)
+            L_reg2 = L_reg2 / len(reg_label2)
+        #^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ L_reg objective ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^#
+         
+        ################################# ORCA objective #################################
+        # ORCA objective include standard cross-entropy (labeled), BCE loss (labeled & unlabeled) and Entropy_loss (mean-distribution)
+        if True:
+            # calculate distance
+            feat_detach = feat.detach()
+            feat_norm = feat_detach / torch.norm(feat_detach, 2, 1, keepdim=True)
+            cosine_dist = torch.mm(feat_norm, feat_norm.t())
+
+            pos_pairs = [] # closet index vectors: [512,1]
+            target_np = target.cpu().numpy()
+            # label part for pos_pairs
+            for i in range(labeled_len):
+                target_i = target_np[i]
+                idxs = np.where(target_np == target_i)[0]
+                if len(idxs) == 1:
+                    pos_pairs.append(idxs[0])
+                else:
                     selec_idx = np.random.choice(idxs, 1)
-                pos_pairs.append(int(selec_idx))
+                    while selec_idx == i:
+                        selec_idx = np.random.choice(idxs, 1)
+                    pos_pairs.append(int(selec_idx))
+            # unlabel part for pos_pairs
+            unlabel_cosine_dist = cosine_dist[labeled_len:, :]
+            vals, pos_idx = torch.topk(unlabel_cosine_dist, 2, dim=1)
+            pos_idx = pos_idx[:, 1].cpu().numpy().flatten().tolist()
+            pos_pairs.extend(pos_idx)
 
-        # unlabel part
-        unlabel_cosine_dist = cosine_dist[labeled_len:, :]
-        vals, pos_idx = torch.topk(unlabel_cosine_dist, 2, dim=1)
-        # print(pos_idx.size())
-        # print(pos_idx)
-        pos_idx = pos_idx[:, 1].cpu().numpy().flatten().tolist()
-        pos_pairs.extend(pos_idx) #pos_pairs size: [512,1]
+            # standard cross-entropy (labeled)
+            ce_loss = ce(output[:labeled_len], target)
 
-        # bce + L_cluster
-        cluster_pos_prob = tP2[pos_pairs, :] #cluster_pos_prob size: [512,10]
-        # bce
-        # cluster_pos_sim = torch.bmm(tP1.view(args.batch_size, 1, -1), cluster_pos_prob.view(args.batch_size, -1, 1)).squeeze()
-        # cluster_ones = torch.ones_like(cluster_pos_sim)
-        # cluster_bce_loss = bce(cluster_pos_sim, cluster_ones)
-        # cross-entropy
-        logcluster_pos_prob = torch.log(cluster_pos_prob)
-        L_cluster = - torch.sum(tP1 * logcluster_pos_prob, dim=1).mean() #[170(label)/512-170(unlabel)]
-        #
-        pos_prob = prob2[pos_pairs, :]
-        pos_sim = torch.bmm(prob.view(args.batch_size, 1, -1), pos_prob.view(args.batch_size, -1, 1)).squeeze()
-        ones = torch.ones_like(pos_sim)
-        bce_loss = bce(pos_sim, ones)
-        ce_loss = ce(output[:labeled_len], target)
-        # unlabel ce loss
-        # unlabel_ce_loss = unlabel_ce(output[labeled_len:], cluster_pred[labeled_len:])
-        ###
-        #print("1:",output[labeled_len:].index_select(0,confidence_mask).size())
-        #print("2:",cluster_pred[labeled_len:].index_select(0,confidence_mask).size())
-        ####
-        unlabel_ce_loss = unlabel_ce(output[labeled_len:].index_select(0,confidence_mask) , cluster_pred[labeled_len:].index_select(0,confidence_mask))
-        np_cluster_preds = np.append(np_cluster_preds, cluster_pred[labeled_len:].cpu().numpy())
-        np_unlabel_targets = np.append(np_unlabel_targets, unlabel_target.cpu().numpy())
-        #
-        entropy_loss = entropy(torch.mean(prob, 0))
+            # BCE loss (labeled & unlabeled)
+            pos_prob = prob2[pos_pairs, :]
+            pos_sim = torch.bmm(prob.view(args.batch_size, 1, -1), pos_prob.view(args.batch_size, -1, 1)).squeeze()
+            ones = torch.ones_like(pos_sim)
+            bce_loss = bce(pos_sim, ones)
+
+            # Entropy_loss (mean-distribution)
+            entropy_loss = entropy(torch.mean(prob, 0))
+        #^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ORCA objective ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^#
+
+        ################################# CALIBRATION objective #################################
+        # CALIBRATION objective includes 
+        if True:
+            confidence_cluster_pred, cluster_pred = tP1.max(1) # cluster_pred: [512]; target: [170]
+
+            ### 统计 cluster_pred (伪标签，cluster id) 置信度 ###
+            confidence_list = [0 for _ in range(10)]
+            num_of_cluster = [0 for _ in range(10)]
+            for confidence, cluster_id in zip(confidence_cluster_pred[labeled_len:], cluster_pred[labeled_len:]):
+                confidence_list[cluster_id] += confidence
+                num_of_cluster[cluster_id] += 1
+            for cluster_id, (sum_confidence, num) in enumerate(zip(confidence_list, num_of_cluster)):
+                if num > 0:
+                    confidence_list[cluster_id] = np.around(confidence_list[cluster_id].cpu().detach().numpy()/ num, 4)
+            
+            threshold = 0.95
+            confidence_mask = (confidence_cluster_pred[labeled_len:] > threshold)
+            confidence_mask = torch.nonzero(confidence_mask)
+            confidence_mask = torch.squeeze(confidence_mask)
+            if client_id == 0:
+                print("confidence_mask: ", confidence_mask.cpu().numpy())
+            # sys.exit(0)
+            print("global round: ", global_round, ";   client_id: ", client_id, ";   confidence_list: ", confidence_list)
+
+            # Clustering loss
+            # L_cluster = - torch.sum(tP1 * torch.log(tP2), dim=1).mean();  Clustering loss used in Orchestra (Euclidean distance is also utilized)
+            cluster_pos_prob = tP2[pos_pairs, :] # cluster_pos_prob size: [512,10]
+            L_cluster = - torch.sum(tP1 * torch.log(cluster_pos_prob), dim=1).mean() #[170(label)/512-170(unlabel)]
+            
+            # bce
+            # cluster_pos_sim = torch.bmm(tP1.view(args.batch_size, 1, -1), cluster_pos_prob.view(args.batch_size, -1, 1)).squeeze()
+            # cluster_ones = torch.ones_like(cluster_pos_sim)
+            # cluster_bce_loss = bce(cluster_pos_sim, cluster_ones)
+
+            # unlabel ce loss
+            # unlabel_ce_loss = unlabel_ce(output[labeled_len:], cluster_pred[labeled_len:])
+            unlabel_ce_loss = unlabel_ce(output[labeled_len:].index_select(0, confidence_mask) , cluster_pred[labeled_len:].index_select(0, confidence_mask))
+
+            np_cluster_preds = np.append(np_cluster_preds, cluster_pred[labeled_len:].cpu().numpy())
+            np_unlabel_targets = np.append(np_unlabel_targets, unlabel_target.cpu().numpy())
+        #^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ CALIBRATION objective ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^#
         
-        #loss = - entropy_loss + ce_loss + bce_loss
-        # loss = ce_loss
+        ################################# Final objective #################################
         if global_round > 4: #4
             if global_round > 6: #6
-                loss = - entropy_loss + ce_loss + bce_loss + 0.5 * L_cluster + unlabel_ce_loss #+ 2 * L_reg1 + 2 * L_reg2  # + L_cluster # 调整L_reg倍率
+                loss = - entropy_loss + ce_loss + bce_loss + 0.5 * L_cluster + unlabel_ce_loss # + 2 * L_reg1 + 2 * L_reg2  # + L_cluster # 调整L_reg倍率
             else:
-                loss = - entropy_loss + ce_loss + bce_loss + 0.5 * L_cluster #+ 2 * L_reg1 + 2 * L_reg2 #+ L_cluster # 调整L_reg倍率
+                loss = - entropy_loss + ce_loss + bce_loss + 0.5 * L_cluster # + 2 * L_reg1 + 2 * L_reg2 #+ L_cluster # 调整L_reg倍率
         else:
-            loss = - entropy_loss + ce_loss + bce_loss #+ 2 * L_reg1 + 2 * L_reg2 # 调整L_reg倍率
-        if client_id == 0:
-            print("entropy_loss: ", entropy_loss)
-            print("ce_loss: ", ce_loss)
-            print("bce_loss: ", bce_loss)
-            print("L_cluster: ", L_cluster)
-            print("unlabel_ce_loss: ", unlabel_ce_loss)
-        # print("L_reg1: ", 2 * L_reg1)
-        # print("L_reg2: ", 2 * L_reg2)
-        # sys.exit(0)
-
-        bce_losses.update(bce_loss.item(), args.batch_size)
-        ce_losses.update(ce_loss.item(), args.batch_size)
-        entropy_losses.update(entropy_loss.item(), args.batch_size)
+            loss = - entropy_loss + ce_loss + bce_loss # + 2 * L_reg1 + 2 * L_reg2 # 调整L_reg倍率
+        
+        print("index {}, entropy_loss {}, ce_loss {}, bce_loss {}, L_cluster {}, unlabel_ce_loss {}".format(batch_idx, entropy_loss.item(), ce_loss.item(), bce_loss.item(), L_cluster.item(), unlabel_ce_loss.item()))
+        #^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Final objective ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^#
+        
+        # ------------------------------ Tracking ------------------------------
+        if is_track:
+            bce_losses.update(bce_loss.item(), args.batch_size)
+            ce_losses.update(ce_loss.item(), args.batch_size)
+            entropy_losses.update(entropy_loss.item(), args.batch_size)
+        # ------------------------------ Tracking ------------------------------
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-    #if ((args.epochs * global_round + epoch) % 10 == 0) and (client_id == 0):
 
-    #if client_id == 0:
-        #unlabel_acc, w_unlabel_acc = cluster_acc_w(np.array(cluster_pred[labeled_len:].cpu().numpy()), np.array(unlabel_target.cpu().numpy()))
+    # if client_id == 0:
+    # unlabel_acc, w_unlabel_acc = cluster_acc_w(np.array(cluster_pred[labeled_len:].cpu().numpy()), np.array(unlabel_target.cpu().numpy()))
     np_cluster_preds = np_cluster_preds.astype(int)
     unlabel_acc, w_unlabel_acc = cluster_acc_w(np_cluster_preds, np_unlabel_targets)
     print("unlabel_acc: ", unlabel_acc)
     print("w_unlabel_acc: ", w_unlabel_acc)
-        #print("unlabel target: ", unlabel_target)
-        #print("unlabel cluster_pred: ", cluster_pred[labeled_len:])
+    # print("unlabel target: ", unlabel_target)
+    # print("unlabel cluster_pred: ", cluster_pred[labeled_len:])
     #sys.exit(0)
 
-    # tf_writer.add_scalar('client{}/loss/bce'.format(client_id), bce_losses.avg, args.epochs * global_round + epoch)
-    # tf_writer.add_scalar('client{}/loss/ce'.format(client_id), ce_losses.avg, args.epochs * global_round + epoch)
-    # tf_writer.add_scalar('client{}/loss/entropy'.format(client_id), entropy_losses.avg, args.epochs * global_round + epoch)
     tf_writer.add_scalars('client{}/loss'.format(client_id), {"bce": bce_losses.avg}, args.epochs * global_round + epoch)
     tf_writer.add_scalars('client{}/loss'.format(client_id), {"ce": ce_losses.avg}, args.epochs * global_round + epoch)
     tf_writer.add_scalars('client{}/loss'.format(client_id), {"entropy": entropy_losses.avg}, args.epochs * global_round + epoch)
-
 
 def test(args, model, labeled_num, device, test_loader, epoch, tf_writer, client_id, global_round):
     model.eval()
@@ -314,106 +314,86 @@ def test(args, model, labeled_num, device, test_loader, epoch, tf_writer, client
     targets = np.array([])
     confs = np.array([])
     with torch.no_grad():
-        C = model.centroids.weight.data.detach().clone().T
+        C = model.centroids.weight.data.detach().clone().T # C: [input, output] = [512, 10]
         for batch_idx, (x, label) in enumerate(test_loader):
             x, label = x.to(device), label.to(device)
             output, feat = model(x)
             prob = F.softmax(output, dim=1)
-            conf, pred = prob.max(1)
+            conf, pred = prob.max(1) # prediction of network
             # cluster pred
             Z1 = F.normalize(feat, dim=1)
             cP1 = Z1 @ C
-            tP1 = F.softmax(cP1 / model.T, dim=1)
+            tP1 = F.softmax(cP1 / model.T, dim=1) # prediciton from centroids
             _, cluster_pred = tP1.max(1) # return #1: max data    #2: max data index
-            #
+            
             targets = np.append(targets, label.cpu().numpy())
             preds = np.append(preds, pred.cpu().numpy())
             cluster_preds = np.append(cluster_preds, cluster_pred.cpu().numpy())
             confs = np.append(confs, conf.cpu().numpy())
+    # Converts the targets array to an integer type.
     targets = targets.astype(int)
     preds = preds.astype(int)
     cluster_preds = cluster_preds.astype(int)
 
-    seen_mask = targets < labeled_num
-    unseen_mask = ~seen_mask
-    ## preds <-> cluster_preds ##
-    origin_preds = preds
-    # preds = cluster_preds
-    ## local_unseen_mask (4) ##
-    local_unseen_mask_4 = targets == 4
-    local_unseen_acc_4 = cluster_acc(preds[local_unseen_mask_4], targets[local_unseen_mask_4])
-    ## local_unseen_mask (4) ##
-    local_unseen_mask_5 = targets == 5
-    local_unseen_acc_5 = cluster_acc(preds[local_unseen_mask_5], targets[local_unseen_mask_5])
-    ## local_unseen_mask (4) ##
+    seen_mask = targets < labeled_num # bool binary array, labeled class: True, unseen class: False
+    unseen_mask = ~seen_mask # bool binary array, labeled class: False, unseen class: True
+
+    ## local_unseen_mask (lu_mask) (6) ##
     local_unseen_mask_6 = targets == 6
     local_unseen_acc_6 = cluster_acc(preds[local_unseen_mask_6], targets[local_unseen_mask_6])
-    ## local_unseen_mask (4) ##
-    local_unseen_mask_7 = targets == 7
-    local_unseen_acc_7 = cluster_acc(preds[local_unseen_mask_7], targets[local_unseen_mask_7])
-    ## local_unseen_mask (4) ##
-    local_unseen_mask_8 = targets == 8
-    local_unseen_acc_8 = cluster_acc(preds[local_unseen_mask_8], targets[local_unseen_mask_8])
-    ## local_unseen_mask (4) ##
-    local_unseen_mask_9 = targets == 9
-    local_unseen_acc_9 = cluster_acc(preds[local_unseen_mask_9], targets[local_unseen_mask_9])
-    ## global_unseen_mask (5-9) ##
-    global_unseen_mask = targets > labeled_num
-    global_unseen_acc = cluster_acc(preds[global_unseen_mask], targets[global_unseen_mask])
-    ##
-    # overall_acc = cluster_acc(preds, targets)
-    overall_acc, w_overall_acc = cluster_acc_w(origin_preds, targets)
-    if ((args.epochs * global_round + epoch) % 10 == 0) and (client_id == 0):
-        print("w_overall_acc: ", w_overall_acc)
+    ## gu_mask (7-9) (gu_mask)##
+    gu_mask = targets > labeled_num
+    gu_acc = cluster_acc(preds[gu_mask], targets[gu_mask])
+    au_acc = cluster_acc(preds[unseen_mask], targets[unseen_mask])
+    # unseen_acc, w_unseen_acc = cluster_acc_w(preds[unseen_mask], targets[unseen_mask])
+    # if ((args.epochs * global_round + epoch) % 10 == 0) and (client_id == 0):
+    #     print("w_unseen_acc: ", w_unseen_acc)
+
+    overall_acc = cluster_acc(preds, targets)
+    # overall_acc, w_overall_acc = cluster_acc_w(preds, targets)
+    # if ((args.epochs * global_round + epoch) % 10 == 0) and (client_id == 0):
+    #     print("w_overall_acc: ", w_overall_acc)
+
+    seen_acc = accuracy(preds[seen_mask], targets[seen_mask])
+    
     # cluster_acc
     overall_cluster_acc = cluster_acc(cluster_preds, targets)
-    #
-    # seen_acc = accuracy(preds[seen_mask], targets[seen_mask])
-    seen_acc = accuracy(origin_preds[seen_mask], targets[seen_mask])
-    #
-    unseen_acc, w_unseen_acc = cluster_acc_w(preds[unseen_mask], targets[unseen_mask])
-    if ((args.epochs * global_round + epoch) % 10 == 0) and (client_id == 0):
-        print("w_unseen_acc: ", w_unseen_acc)
+    
     unseen_nmi = metrics.normalized_mutual_info_score(targets[unseen_mask], preds[unseen_mask])
     mean_uncert = 1 - np.mean(confs)
-    print('epoch {}, Client id {}, Test overall acc {:.4f}, Test overall cluster acc {:.4f}, seen acc {:.4f}, unseen acc {:.4f}, local_unseen acc {:.4f}, global_unseen acc {:.4f}'.format(epoch, client_id, overall_acc, overall_cluster_acc, seen_acc, unseen_acc, local_unseen_acc_6, global_unseen_acc))
+
+    # Track
+    print('epoch {}, Client id {}, Test overall acc {:.4f}, Test overall cluster acc {:.4f}, seen acc {:.4f}, unseen acc {:.4f}, local_unseen acc {:.4f}, global_unseen acc {:.4f}'.format(epoch, client_id, overall_acc, overall_cluster_acc, seen_acc, au_acc, local_unseen_acc_6, gu_acc))
+    # format(epoch, client_id, overall_acc, overall_cluster_acc, seen_acc, au_acc, local_unseen_acc_6, gu_acc)
+    # 'add_scalar'
     # tf_writer.add_scalar('client{}/acc/overall'.format(client_id), overall_acc, args.epochs * global_round + epoch)
     # tf_writer.add_scalar('client{}/acc/seen'.format(client_id), seen_acc, args.epochs * global_round + epoch)
-    # tf_writer.add_scalar('client{}/acc/unseen'.format(client_id), unseen_acc, args.epochs * global_round + epoch)
+    # tf_writer.add_scalar('client{}/acc/unseen'.format(client_id), au_acc, args.epochs * global_round + epoch)
+    # 'add_scalars'
     tf_writer.add_scalars('client{}/acc'.format(client_id), {"overall": overall_acc}, args.epochs * global_round + epoch)
     tf_writer.add_scalars('client{}/acc'.format(client_id), {"seen": seen_acc}, args.epochs * global_round + epoch)
-    tf_writer.add_scalars('client{}/acc'.format(client_id), {"unseen": unseen_acc}, args.epochs * global_round + epoch)
-    ##
-    tf_writer.add_scalars('client{}/acc'.format(client_id), {"local_unseen_4": local_unseen_acc_4}, args.epochs * global_round + epoch)
-    tf_writer.add_scalars('client{}/acc'.format(client_id), {"local_unseen_5": local_unseen_acc_5}, args.epochs * global_round + epoch)
+    tf_writer.add_scalars('client{}/acc'.format(client_id), {"unseen": au_acc}, args.epochs * global_round + epoch)
     tf_writer.add_scalars('client{}/acc'.format(client_id), {"local_unseen_6": local_unseen_acc_6}, args.epochs * global_round + epoch)
-    tf_writer.add_scalars('client{}/acc'.format(client_id), {"local_unseen_7": local_unseen_acc_7}, args.epochs * global_round + epoch)
-    tf_writer.add_scalars('client{}/acc'.format(client_id), {"local_unseen_8": local_unseen_acc_8}, args.epochs * global_round + epoch)
-    tf_writer.add_scalars('client{}/acc'.format(client_id), {"local_unseen_9": local_unseen_acc_9}, args.epochs * global_round + epoch)
-    # #
-    tf_writer.add_scalars('client{}/acc'.format(client_id), {"global_unseen": global_unseen_acc}, args.epochs * global_round + epoch)
+    tf_writer.add_scalars('client{}/acc'.format(client_id), {"global_unseen": gu_acc}, args.epochs * global_round + epoch)
     ##
     tf_writer.add_scalar('client{}/nmi/unseen'.format(client_id), unseen_nmi, args.epochs * global_round + epoch)
     tf_writer.add_scalar('client{}/uncert/test'.format(client_id), mean_uncert, args.epochs * global_round + epoch)
     return mean_uncert
-
 
 def main():
     args, device = args_setting()
 
     # dataset initialization
     if args.dataset == 'cifar10':
-        #train_label_set = client_datasets.OPENWORLDCIFAR10(root='./datasets', labeled=True, labeled_num=args.labeled_num, labeled_ratio=args.labeled_ratio, download=True, transform=TransformTwice(datasets.dict_transform['cifar_train']), exist_label_list=[0,1,2,3,4,5,6,7,8,9], clients_num=args.clients_num)
+        # train_label_set = client_datasets.OPENWORLDCIFAR10(root='./datasets', labeled=True, labeled_num=args.labeled_num, labeled_ratio=args.labeled_ratio, download=True, transform=TransformTwice(datasets.dict_transform['cifar_train']), exist_label_list=[0,1,2,3,4,5,6,7,8,9], clients_num=args.clients_num)
         train_label_set = datasets.OPENWORLDCIFAR10(root='./datasets', labeled=True, labeled_num=10, labeled_ratio=args.labeled_ratio, download=True, transform=TransformTwice(datasets.dict_transform['cifar_train']))
         # train_unlabel_set = client_datasets.OPENWORLDCIFAR10(root='./datasets', labeled=False, labeled_num=args.labeled_num, labeled_ratio=args.labeled_ratio, download=True, transform=TransformTwice(datasets.dict_transform['cifar_train']), unlabeled_idxs=train_label_set.unlabeled_idxs, exist_label_list=[0,1,2,3,4,5], clients_num=args.clients_num)
         # test_set = client_datasets.OPENWORLDCIFAR10(root='./datasets', labeled=False, labeled_num=args.labeled_num, labeled_ratio=args.labeled_ratio, download=True, transform=datasets.dict_transform['cifar_test'], unlabeled_idxs=train_label_set.unlabeled_idxs, exist_label_list=[0,1,2,3,4,5], clients_num=args.clients_num)
         num_classes = 10
+
         ### prepare clients dataset ###
-        ## 子集
-        # exist_label_list=[[0,1,2,3,4,5], [0,1,2,3,4,6], [0,1,2,3,4,7], [0,1,2,3,4,8], [0,1,2,3,4,9]]
-        # clients_labeled_num = [4, 4, 4, 4, 4]
-        ## 全集
         exist_label_list=[[0,1,2,3,4,5,6,7], [0,1,2,3,4,5,6,7], [0,1,2,3,4,5,6,8], [0,1,2,3,4,5,6,8], [0,1,2,3,4,5,6,9]]
+        # Here 0,1,2,3,4,5 are the labeled classes for each client; 6 are global unseen; 7,8,9 are local unseen
         clients_labeled_num = [6, 6, 6, 6, 6] # the number of labeled class for each client (here number of clients equals 5)
         
         clients_train_label_set = []
@@ -464,8 +444,8 @@ def main():
     client_train_unlabel_loader = []
     client_test_loader = []
     for i in range(args.clients_num): # train_label_loader->client_train_label_loader[];   train_unlabel_loader -> client_train_unlabel_loader[]
-        train_label_loader = torch.utils.data.DataLoader(clients_train_label_set[i], batch_size=clients_labeled_batch_size[i], shuffle=True, num_workers=8, drop_last=True)
-        train_unlabel_loader = torch.utils.data.DataLoader(clients_train_unlabel_set[i], batch_size=args.batch_size - clients_labeled_batch_size[i], shuffle=True, num_workers=8, drop_last=True)
+        train_label_loader = torch.utils.data.DataLoader(clients_train_label_set[i], batch_size=clients_labeled_batch_size[i], shuffle=True, num_workers=16, drop_last=True)
+        train_unlabel_loader = torch.utils.data.DataLoader(clients_train_unlabel_set[i], batch_size=args.batch_size - clients_labeled_batch_size[i], shuffle=True, num_workers=16, drop_last=True)
         client_train_label_loader.append(train_label_loader)
         client_train_unlabel_loader.append(train_unlabel_loader)
         # test_loader
