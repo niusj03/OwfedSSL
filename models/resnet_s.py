@@ -12,6 +12,8 @@ from models.criterion import AngularPenaltySMLoss
 import sys
 
 __all__ = ['resnet18']
+
+
 # Sinkhorn Knopp
 def sknopp(cZ, lamd=25, max_iters=100):
     with torch.no_grad():
@@ -121,11 +123,10 @@ class ResNet(nn.Module):
         self.linear = NormedLinear(512 * block.expansion, num_classes)
         ##
         self.N_local = 32
-        self.mem_projections = nn.Linear(1024, 512, bias=False) # para1: Memory size per client
+        self.mem_projections = nn.Linear(1024, 512, bias=False) # para1: Memory size per client; Just a queue, 1024 refers to the queue length
         #self.centroids = NormedLinear(512 * block.expansion, num_classes) # global cluster centroids
         self.centroids = nn.Linear(512 * block.expansion, num_classes, bias=False)  # global cluster centroids
         self.local_centroids = nn.Linear(512 * block.expansion, self.N_local, bias=False)  # must be defined last
-        # self.global_labeled_centroids = nn.Linear(512 * block.expansion, 10, bias=False)  # labeled data feature centroids
         self.local_labeled_centroids = nn.Linear(512 * block.expansion, num_classes, bias=False) # labeled data feature centroids
         self.T = 0.1
         self.labeled_num = 6
@@ -149,63 +150,34 @@ class ResNet(nn.Module):
                     nn.init.constant_(m.bn2.weight, 0)
 
     @torch.no_grad()
-    def update_memory(self, F):
+    def update_memory(self, F): # update the queue/ memory; m_size is memory size = queue length
         N = F.shape[0]
-        # Shift memory [D, m_size]
-        self.mem_projections.weight.data[:, :-N] = self.mem_projections.weight.data[:, N:].detach().clone()
-        # Transpose LHS [D, bsize]
+        self.mem_projections.weight.data[:, :-N] = self.mem_projections.weight.data[:, N:].detach().clone() # [D_out, D_in] = [512,1024]; save in terms of input nodes.
         self.mem_projections.weight.data[:, -N:] = F.T.detach().clone()
 
     # Local clustering (happens at the client after every training round; clusters are made equally sized via Sinkhorn-Knopp, satisfying K-anonymity)
     def local_clustering(self, device=torch.device("cuda")):
         # Local centroids: [# of centroids, D]; local clustering input (mem_projections.T): [m_size, D]
         with torch.no_grad():
-            Z = self.mem_projections.weight.data.T.detach().clone()
-            centroids = Z[np.random.choice(Z.shape[0], self.N_local, replace=False)]
+            Z = self.mem_projections.weight.data.T.detach().clone() # Z is [1024, 512] = [m_size, D]
+            centroids = Z[np.random.choice(Z.shape[0], self.N_local, replace=False)] # Randomly initialize centroids (N_loacl) from Z
             local_iters = 5
             # clustering
             for it in range(local_iters):
-                assigns = sknopp(Z @ centroids.T, max_iters=10)
+                assigns = sknopp(Z @ centroids.T, max_iters=10) # matrix multiplication, Z@centroids.T is [m_size, N_local = assigns
                 choice_cluster = torch.argmax(assigns, dim=1)
                 for index in range(self.N_local):
-                    selected = torch.nonzero(choice_cluster == index).squeeze()
-                    selected = torch.index_select(Z, 0, selected)
+                    selected = torch.nonzero(choice_cluster == index).squeeze() # output the index whose category is `index`
+                    selected = torch.index_select(Z, 0, selected) # select the data the Z from the index of `selected`
                     if selected.shape[0] == 0:
                         selected = Z[torch.randint(len(Z), (1,))]
                     centroids[index] = F.normalize(selected.mean(dim=0), dim=0)
 
-        # Save local centroids
-        self.local_centroids.weight.data.copy_(centroids.to(device))
-
-    # Global clustering (happens only on the server; see Genevay et al. for full details on the algorithm)
-    # def global_clustering(self, Z1, nG=1., nL=1.):
-    #     N = Z1.shape[0] # Z has dimensions [m_size * n_clients, D]
-    #     # Optimizer setup
-    #     optimizer = torch.optim.SGD(self.centroids.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4)
-    #     train_loss = 0.
-    #     total_rounds = 500
-    #     for round_idx in range(total_rounds):
-    #         with torch.no_grad():
-    #             # Cluster assignments from Sinkhorn Knopp
-    #             SK_assigns = sknopp(self.centroids(Z1))
-    #         # Zero grad
-    #         optimizer.zero_grad()
-    #         # Predicted cluster assignments [N, N_centroids] = local centroids [N, D] x global centroids [D, N_centroids]
-    #         probs1 = F.softmax(self.centroids(F.normalize(Z1, dim=1)) / self.T, dim=1)
-    #         # Match predicted assignments with SK assignments
-    #         loss = - F.cosine_similarity(SK_assigns, probs1, dim=-1).mean()
-    #         # Train
-    #         loss.backward()
-    #         optimizer.step()
-    #         with torch.no_grad():
-    #             #self.centroids.weight.copy_(self.centroids.weight.data.clone()) # Not Normalize centroids
-    #             self.centroids.weight.copy_(F.normalize(self.centroids.weight.data.clone(), dim=1)) # Normalize centroids
-    #             train_loss += loss.item()
-    #     ######
-    ###
+        self.local_centroids.weight.data.copy_(centroids.to(device)) # Update local centroids [N_local, D]
+        
     # Global clustering (happens only on the server; see Genevay et al. for full details on the algorithm)
     def global_clustering(self, Z1, nG=1., nL=1.):
-        N = Z1.shape[0] # Z has dimensions [m_size * n_clients, D]
+        N = Z1.shape[0] # Z has dimensions [N_local * n_clients, D]
         # Optimizer setup
         optimizer = torch.optim.SGD(self.centroids.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4)
         train_loss = 0.
@@ -215,8 +187,7 @@ class ResNet(nn.Module):
             with torch.no_grad():
                 # Cluster assignments from Sinkhorn Knopp
                 SK_assigns = sknopp(self.centroids(Z1))
-            # Zero grad
-            optimizer.zero_grad()
+            optimizer.zero_grad() # Zero grad
             # Predicted cluster assignments [N, N_centroids] = local centroids [N, D] x global centroids [D, N_centroids]
             probs1 = F.softmax(self.centroids(F.normalize(Z1, dim=1)) / self.T, dim=1)
             ## 增加 Prototype距离 ##
@@ -226,8 +197,8 @@ class ResNet(nn.Module):
             # print("angular_loss: ", angular_loss)
             ######################
             # Match predicted assignments with SK assignments
-            cos_loss = F.cosine_similarity(SK_assigns, probs1, dim=-1).mean()
-            loss = - cos_loss #+ angular_loss
+            cos_loss = - F.cosine_similarity(SK_assigns, probs1, dim=-1).mean()
+            loss = cos_loss #+ angular_loss
             print("F.cosine_similarity: ", cos_loss)
             # Train
             loss.backward()
@@ -237,8 +208,8 @@ class ResNet(nn.Module):
                 self.centroids.weight.copy_(F.normalize(self.centroids.weight.data.clone(), dim=1)) # Normalize centroids
                 train_loss += loss.item()
         #sys.exit(0)
-        ######
-    ###
+
+    # Set labeled feature centroids
     def set_labeled_feature_centroids(self, device=torch.device("cuda")):
         assignment = [999 for _ in range(self.labeled_num)]
         not_assign_list = [i for i in range(10)]
@@ -252,7 +223,7 @@ class ResNet(nn.Module):
         C_norm = C
         labeled_norm = labeled_feature_centroids / torch.norm(labeled_feature_centroids, 2, 1, keepdim=True)
         cosine_dist = torch.mm(labeled_norm, C_norm.t()) # [labeled_num, 10]
-        vals, pos_idx = torch.topk(cosine_dist, 2, dim=1)
+        vals, pos_idx = torch.topk(cosine_dist, 2, dim=1) # 沿着指定的维度（dim=1），为每一行找出最大的k个元素及其索引。在这个具体的例子中，k被设定为2，意味着它会找出每一行（即每个已标记特征中心）与全局聚类中心（C的行）的余弦距离中最大的两个值，这两个值表示了最接近的两个全局聚类中心。
         pos_idx_1 = pos_idx[:, 0].cpu().numpy().flatten().tolist() # top1 [labeled_num]
         pos_idx_2 = pos_idx[:, 1].cpu().numpy().flatten().tolist() # top2 [labeled_num]
         print("cosine_dist: ", cosine_dist)
@@ -269,6 +240,7 @@ class ResNet(nn.Module):
                 assignment[idx] = pos_idx_2[idx]
                 not_assign_list.remove(assignment[idx])
                 #C[assignment[idx]] = labeled_feature_centroids[idx]
+                
         # set labeled centroids at first
         for idx in range(10):
             if idx < self.labeled_num:

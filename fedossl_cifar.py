@@ -26,38 +26,64 @@ def euclidean_dist(x, y):
     dist = dist.clamp(min=1e-12).sqrt()  # for numerical stability
     return dist
 
+
+
 def receive_models(clients_model):
     global uploaded_weights
     global uploaded_models
     uploaded_weights = []
     uploaded_models = []
     for model in clients_model:
-        uploaded_weights.append( 1.0 / len(clients_model))
+        uploaded_weights.append( 1.0 / len(clients_model)) # each model is given equal importance in the aggregation process
         # self.uploaded_models.append(copy.deepcopy(client.model.parameters()))
         uploaded_models.append(model.parameters())
 
 
 def add_parameters(w, client_model):
     for (name, server_param), client_param in zip(global_model.named_parameters(), client_model):
-        if "centroids" not in name:
+        if "centroids" not in name: # 'centroids', 'local centroids' and 'local labeled centroids'
             server_param.data += client_param.data.clone() * w
         if "local_labeled_centroids" in name:
             server_param.data += client_param.data.clone() * w
-            # print("Averaged layer name: ", name)
-
 
 def aggregate_parameters():
+    # resets the weights of global model to zero, except for the centroids and local_centroids
     for name, param in global_model.named_parameters():
         if "centroids" not in name:
             param.data = torch.zeros_like(param.data)
         if "local_labeled_centroids" in name:
             param.data = torch.zeros_like(param.data)
-            # print("zeros_liked layer name: ", name)
     for w, client_model in zip(uploaded_weights, uploaded_models):
+        # update the global model with the weighted sum of the client models: backbone parameters and 
         add_parameters(w, client_model)
 
+def args_setting():
+    parser = argparse.ArgumentParser(description='orca')
+    parser.add_argument('--milestones', nargs='+', type=int, default=[140, 180])
+    parser.add_argument('--dataset', default='cifar10', help='dataset setting')
+    parser.add_argument('--clients-num', default=5, type=int)
+    parser.add_argument('--global-rounds', default=40, type=int)
+    parser.add_argument('--labeled-num', default=5, type=int)
+    parser.add_argument('--labeled-ratio', default=0.5, type=float)
+    parser.add_argument('--seed', type=int, default=1, metavar='S', help='random seed (default: 1)')
+    parser.add_argument('--name', type=str, default='debug')
+    parser.add_argument('--exp_root', type=str, default='./results/')
+    parser.add_argument('--epochs', type=int, default=5)
+    parser.add_argument('-b', '--batch-size', default=512, type=int,
+                    metavar='N',
+                    help='mini-batch size')
+    args = parser.parse_args()
+    args.cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if args.cuda else "cpu")
+    print("-------------------- use ",device,"-----------")
+    args.savedir = os.path.join(args.exp_root, args.name)
+    if not os.path.exists(args.savedir):
+        os.makedirs(args.savedir)
+    return args, device
 
-def train(args, model, device, train_label_loader, train_unlabel_loader, optimizer, m, epoch, tf_writer, client_id, global_round):
+
+
+def train(args, model, device, train_label_loader, train_unlabel_loader, optimizer, m, epoch, tf_writer, client_id, global_round): # m refers to mean_uncert
     model.local_labeled_centroids.weight.data.zero_()  # model.local_labeled_centroids.weight.data: torch.Size([10, 512])
     labeled_samples_num = [0 for _ in range(10)]
     model.train()
@@ -73,11 +99,12 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
     #
     np_cluster_preds = np.array([]) # cluster_preds
     np_unlabel_targets = np.array([])
-    #
+    
+
     for batch_idx, ((x, x2), target) in enumerate(train_label_loader):
         ## 各个类的不确定性权重（固定值）
         beta = 0.2
-        Nk = [1600 * 5, 1600 * 5, 1600 * 5, 1600 * 5, 1600 * 5, 1600 * 5,    1600, 1600, 1600, 1600]
+        Nk = [1600 * 5, 1600 * 5, 1600 * 5, 1600 * 5, 1600 * 5, 1600 * 5, 1600, 1600, 1600, 1600]
         Nmax = 1600 * 5
         p_weight = [beta**(1-Nk[i]/Nmax) for i in range(10)]
         #
@@ -85,7 +112,7 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
 
         x = torch.cat([x, ux], 0)
         x2 = torch.cat([x2, ux2], 0)
-        #
+        
         labeled_len = len(target)
         # print("labeled_len: ", labeled_len)
 
@@ -99,10 +126,12 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
         reg_prob2 = F.softmax(output2[labeled_len:], dim=1)  # unlabel data's prob
 
         # update local_labeled_centroids
+        # step1: 统计每个类别的样本数，以及每个类别的特征向量之和
         for feature, true_label in zip(feat[:labeled_len].detach().clone(), target):
             labeled_samples_num[true_label] += 1
             model.local_labeled_centroids.weight.data[true_label] += feature
         # print("before model.local_labeled_centroids.weight.data: ", model.local_labeled_centroids.weight.data)
+        # step2: 更新每个类别的特征向量
         for idx, (feature_centroid, num) in enumerate(zip(model.local_labeled_centroids.weight.data, labeled_samples_num)):
             if num > 0:
                 model.local_labeled_centroids.weight.data[idx] = feature_centroid/num
@@ -119,7 +148,7 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
             copy_reg_prob1[idx][label] = 1
         for idx, (label, oprob) in enumerate(zip(reg_label2, copy_reg_prob2)):
             copy_reg_prob2[idx][label] = 1
-        #
+        
         L1_loss = nn.L1Loss()
         L_reg1 = 0.0
         L_reg2 = 0.0
@@ -130,14 +159,14 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
         L_reg1 = L_reg1 / len(reg_label1)
         L_reg2 = L_reg2 / len(reg_label2)
         #### Ours loss end
-        ## 欧氏距离 ########################################################################
+        ## Euclidean Distance ########################################################################
         # C = model.centroids.weight.data.detach().clone()
         # Z1 = feat.detach()
         # Z2 = feat2.detach()
         # cP1 = euclidean_dist(Z1, C)
         # cZ2 = euclidean_dist(Z2, C)
         ## Cluster loss begin (Orchestra) # cos-similarity ###############################
-        C = model.centroids.weight.data.detach().clone().T
+        C = model.centroids.weight.data.detach().clone().T # C: [512, 10]
         Z1 = F.normalize(feat, dim=1)
         Z2 = F.normalize(feat2, dim=1)
         cP1 = Z1 @ C
@@ -184,6 +213,8 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
         pos_pairs = []
         target_np = target.cpu().numpy()
         
+
+        # The `L` objective, including standard cross-entropy (labeled) and clustering loss (unlabeled)
         # label part
         for i in range(labeled_len):
             target_i = target_np[i]
@@ -368,28 +399,9 @@ def test(args, model, labeled_num, device, test_loader, epoch, tf_writer, client
 
 
 def main():
-    parser = argparse.ArgumentParser(description='orca')
-    parser.add_argument('--milestones', nargs='+', type=int, default=[140, 180])
-    parser.add_argument('--dataset', default='cifar100', help='dataset setting')
-    parser.add_argument('--clients-num', default=5, type=int)
-    parser.add_argument('--global-rounds', default=40, type=int)
-    parser.add_argument('--labeled-num', default=50, type=int)
-    parser.add_argument('--labeled-ratio', default=0.5, type=float)
-    parser.add_argument('--seed', type=int, default=1, metavar='S', help='random seed (default: 1)')
-    parser.add_argument('--name', type=str, default='debug')
-    parser.add_argument('--exp_root', type=str, default='./results/')
-    parser.add_argument('--epochs', type=int, default=5)
-    parser.add_argument('-b', '--batch-size', default=512, type=int,
-                    metavar='N',
-                    help='mini-batch size')
-    args = parser.parse_args()
-    args.cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if args.cuda else "cpu")
-    print("-------------------- use ",device,"-----------")
-    args.savedir = os.path.join(args.exp_root, args.name)
-    if not os.path.exists(args.savedir):
-        os.makedirs(args.savedir)
+    args, device = args_setting()
 
+    # dataset initialization
     if args.dataset == 'cifar10':
         #train_label_set = client_datasets.OPENWORLDCIFAR10(root='./datasets', labeled=True, labeled_num=args.labeled_num, labeled_ratio=args.labeled_ratio, download=True, transform=TransformTwice(datasets.dict_transform['cifar_train']), exist_label_list=[0,1,2,3,4,5,6,7,8,9], clients_num=args.clients_num)
         train_label_set = datasets.OPENWORLDCIFAR10(root='./datasets', labeled=True, labeled_num=10, labeled_ratio=args.labeled_ratio, download=True, transform=TransformTwice(datasets.dict_transform['cifar_train']))
@@ -402,8 +414,8 @@ def main():
         # clients_labeled_num = [4, 4, 4, 4, 4]
         ## 全集
         exist_label_list=[[0,1,2,3,4,5,6,7], [0,1,2,3,4,5,6,7], [0,1,2,3,4,5,6,8], [0,1,2,3,4,5,6,8], [0,1,2,3,4,5,6,9]]
-        clients_labeled_num = [6, 6, 6, 6, 6]
-        ##
+        clients_labeled_num = [6, 6, 6, 6, 6] # the number of labeled class for each client (here number of clients equals 5)
+        
         clients_train_label_set = []
         clients_train_unlabel_set = []
         clients_test_set = []
@@ -418,12 +430,6 @@ def main():
                                                           transform=TransformTwice(
                                                               datasets.dict_transform['cifar_train']),
                                                           unlabeled_idxs=client_train_label_set.unlabeled_idxs, exist_label_list=exist_label_list[i], clients_num=args.clients_num)
-            # client_test_set = client_datasets.OPENWORLDCIFAR10(root='./datasets', labeled=False, labeled_num=args.labeled_num,
-            #                                             labeled_ratio=args.labeled_ratio, download=True,
-            #                                             transform=datasets.dict_transform['cifar_test'],
-            #                                             unlabeled_idxs=client_train_label_set.unlabeled_idxs,
-            #                                             exist_label_list=exist_label_list[i],
-            #                                             clients_num=args.clients_num)
             client_test_set = client_datasets.OPENWORLDCIFAR10(root='./datasets', labeled=False, labeled_num=args.labeled_num,
                                                         labeled_ratio=args.labeled_ratio, download=True,
                                                         transform=datasets.dict_transform['cifar_test'],
@@ -434,7 +440,8 @@ def main():
             clients_train_label_set.append(client_train_label_set)
             clients_train_unlabel_set.append(client_train_unlabel_set)
             clients_test_set.append(client_test_set)
-        ###
+
+    # Not complete; pending to modify    
     elif args.dataset == 'cifar100':
         train_label_set = datasets.OPENWORLDCIFAR100(root='./datasets', labeled=True, labeled_num=args.labeled_num, labeled_ratio=args.labeled_ratio, download=True, transform=TransformTwice(datasets.dict_transform['cifar_train']))
         train_unlabel_set = datasets.OPENWORLDCIFAR100(root='./datasets', labeled=False, labeled_num=args.labeled_num, labeled_ratio=args.labeled_ratio, download=True, transform=TransformTwice(datasets.dict_transform['cifar_train']), unlabeled_idxs=train_label_set.unlabeled_idxs)
@@ -444,7 +451,7 @@ def main():
         warnings.warn('Dataset is not listed')
         return
 
-    #
+    # labeled batch size for each client is determined by the formula: labeled_batch_size = batch_size * labeled_len / (labeled_len + unlabeled_len)
     clients_labeled_batch_size = []
     for i in range(args.clients_num):
         labeled_len = len(clients_train_label_set[i])
@@ -452,22 +459,22 @@ def main():
         labeled_batch_size = int(args.batch_size * labeled_len / (labeled_len + unlabeled_len))
         clients_labeled_batch_size.append(labeled_batch_size)
 
-    # Initialize the splits  # train_label_loader->client_train_label_loader[];   train_unlabel_loader->client_train_unlabel_loader[]
+    # Initialize the splits  # train_label_loader > client_train_label_loader[];   train_unlabel_loader -> client_train_unlabel_loader[]
     client_train_label_loader = []
     client_train_unlabel_loader = []
     client_test_loader = []
-    for i in range(args.clients_num): # train_label_loader->client_train_label_loader[];   train_unlabel_loader->client_train_unlabel_loader[]
-        train_label_loader = torch.utils.data.DataLoader(clients_train_label_set[i], batch_size=clients_labeled_batch_size[i], shuffle=True, num_workers=2, drop_last=True)
-        train_unlabel_loader = torch.utils.data.DataLoader(clients_train_unlabel_set[i], batch_size=args.batch_size - clients_labeled_batch_size[i], shuffle=True, num_workers=2, drop_last=True)
+    for i in range(args.clients_num): # train_label_loader->client_train_label_loader[];   train_unlabel_loader -> client_train_unlabel_loader[]
+        train_label_loader = torch.utils.data.DataLoader(clients_train_label_set[i], batch_size=clients_labeled_batch_size[i], shuffle=True, num_workers=8, drop_last=True)
+        train_unlabel_loader = torch.utils.data.DataLoader(clients_train_unlabel_set[i], batch_size=args.batch_size - clients_labeled_batch_size[i], shuffle=True, num_workers=8, drop_last=True)
         client_train_label_loader.append(train_label_loader)
         client_train_unlabel_loader.append(train_unlabel_loader)
-
+        # test_loader
         test_loader = torch.utils.data.DataLoader(clients_test_set[i], batch_size=100, shuffle=False, num_workers=1)
         client_test_loader.append(test_loader)
 
-    # Initialize the global_model ##############
+    # Initialize the global_model 
     global global_model
-    global_model = models.resnet18(num_classes=num_classes)
+    global_model = models.resnet18(num_classes=num_classes) # for CIFAR model
     global_model = global_model.to(device)
     if args.dataset == 'cifar10':
         state_dict = torch.load('./pretrained/simclr_cifar_10.pth.tar')
@@ -475,31 +482,24 @@ def main():
         state_dict = torch.load('./pretrained/simclr_cifar_100.pth.tar')
     global_model.load_state_dict(state_dict, strict=False)
     global_model = global_model.to(device)
-    # Freeze the earlier filters
+
+
+    # Freeze the earlier filters: similar to ORCA -> only 'layer4', 'linear' and 'centroids' are trainable
     for name, param in global_model.named_parameters():
         if 'linear' not in name and 'layer4' not in name:
             param.requires_grad = False
         if "centroids" in name:
             param.requires_grad = True
-    ###########################################
 
+    # Initialize the clients' models, optimizers and schedulers
     clients_model = [] # model->clients_model[client_id]
     clients_optimizer = [] # optimizer->clients_optimizer[client_id]
     clients_scheduler = [] # scheduler->clients_scheduler[client_id]
     clients_tf_writer = [] # tf_writer->clients_tf_writer[client_id]
     for i in range(args.clients_num):
-        # First network intialization: pretrain the RotNet network
-        # model = models.resnet18(num_classes=num_classes)
-        # model = model.to(device)
-        # if args.dataset == 'cifar10':
-        #     state_dict = torch.load('./pretrained/simclr_cifar_10.pth.tar')
-        # elif args.dataset == 'cifar100':
-        #     state_dict = torch.load('./pretrained/simclr_cifar_100.pth.tar')
-        # model.load_state_dict(state_dict, strict=False)
         model = copy.deepcopy(global_model)
         model = model.to(device)
-
-        # Freeze the earlier filters
+        # Freeze the earlier filters of client models
         for name, param in model.named_parameters():
             if 'linear' not in name and 'layer4' not in name:
                 param.requires_grad = False
@@ -512,31 +512,30 @@ def main():
         scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.milestones, gamma=0.1)
         clients_optimizer.append(optimizer)
         clients_scheduler.append(scheduler)
-
         #tf_writer = SummaryWriter(log_dir=args.savedir)
         #clients_tf_writer.append(tf_writer)
+
     tf_writer = SummaryWriter(log_dir=args.savedir)
 
-    ## Start FedAvg training ##
+    ## Start FedoAvg training ##
     for global_round in range(args.global_rounds):
-        print(" Start global_round {}: ".format(global_round))
+        print("Start global_round {}: ".format(global_round))
         for client_id in range(args.clients_num):
-            for epoch in range(args.epochs):
+            for epoch in range(args.epochs): # train local model in E epochs
                 mean_uncert = test(args, clients_model[client_id], args.labeled_num, device, client_test_loader[client_id], epoch, tf_writer, client_id, global_round)
                 train(args, clients_model[client_id], device, client_train_label_loader[client_id], client_train_unlabel_loader[client_id], clients_optimizer[client_id], mean_uncert, epoch, tf_writer, client_id, global_round)
                 clients_scheduler[client_id].step()
             # local_clustering #
             clients_model[client_id].local_clustering(device=device)
 
-        # receive_models
+        # receive_models/ upload local models
         receive_models(clients_model)
-
-        # aggregate_parameters #global model 平均了所有client的模型参数
+        # aggregate_parameters #global model average parameters across all the clients
         aggregate_parameters()
 
-        # Run global clustering
+        # Run global clustering: concatenate `local centroids` parameters in each client into global variable `Z1`; `local centroids` [N_local, D]; 
         for client_id in range(args.clients_num):
-            for c_name, old_param in clients_model[client_id].named_parameters():
+            for c_name, old_param in clients_model[client_id].named_parameters(): # c_name: layer name; old_param: layer parameters
                 if "local_centroids" in c_name:
                     if client_id == 0:
                         Z1 = np.array(copy.deepcopy(old_param.data.cpu().clone()))
@@ -546,7 +545,6 @@ def main():
         global_model.global_clustering(Z1.to(device).T) # update self.centroids in global model
         # set labeled data feature instead of self.centroids
         global_model.set_labeled_feature_centroids(device=device)
-        #
 
         # download global model param
         # name_filters = ['linear', "mem_projections", "centroids", "local_centroids"]
@@ -559,10 +557,11 @@ def main():
                     # print("Download layer name: ", g_name)
             # sys.exit(0)
 
-    ## finish train ##
-    torch.save(global_model.state_dict(), './fedrep-trained-model/0102_Ours_cluster-classifier_global.pth')
-    for client_id in range(args.clients_num):
-        torch.save(clients_model[client_id].state_dict(), './fedrep-trained-model/0102_Ours_cluster-classifier_client{}-model.pth'.format(client_id))
+    ## finish train ##        
+                    
+    # torch.save(global_model.state_dict(), './fedrep-trained-model/0102_Ours_cluster-classifier_global.pth')
+    # for client_id in range(args.clients_num):
+    #     torch.save(clients_model[client_id].state_dict(), './fedrep-trained-model/0102_Ours_cluster-classifier_client{}-model.pth'.format(client_id))
     ## save model
 
 if __name__ == '__main__':
