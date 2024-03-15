@@ -286,11 +286,11 @@ def train(args, model, device, train_label_loader, train_unlabel_loader, optimiz
 
         if global_round > 4: #4
             if global_round > 6: #6
-                loss = - entropy_loss + ce_loss + bce_loss + 0.5 * L_cluster + unlabel_ce_loss # + 2 * L_reg1 + 2 * L_reg2  # + L_cluster # 调整L_reg倍率
+                loss = + ce_loss + bce_loss + 0.5 * L_cluster + unlabel_ce_loss # + 2 * L_reg1 + 2 * L_reg2  # + L_cluster # 调整L_reg倍率
             else:
-                loss = - entropy_loss + ce_loss + bce_loss + 0.5 * L_cluster # + 2 * L_reg1 + 2 * L_reg2 #+ L_cluster # 调整L_reg倍率
+                loss = + ce_loss + bce_loss + 0.5 * L_cluster # + 2 * L_reg1 + 2 * L_reg2 #+ L_cluster # 调整L_reg倍率
         else:
-            loss = - entropy_loss + ce_loss + bce_loss # + 2 * L_reg1 + 2 * L_reg2 # 调整L_reg倍率
+            loss = + ce_loss + bce_loss # + 2 * L_reg1 + 2 * L_reg2 # 调整L_reg倍率
         
         # print("index {}, entropy_loss {}, ce_loss {}, bce_loss {}, L_cluster {}, unlabel_ce_loss {}".format(batch_idx, entropy_loss.item(), ce_loss.item(), bce_loss.item(), L_cluster.item(), unlabel_ce_loss.item()))
         #^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Final objective ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^#
